@@ -138,3 +138,7 @@ dmypy.json
 .pyre/
 datasets/
 scratch/
+experiments/
+results/
+experiments/
+

@@ -12,9 +12,48 @@ decord.bridge.set_bridge('torch')
 from torchvision import transforms
 from read_spatio_temporal_data import *
 import torch.nn.functional as F
-import argparse
-import os 
-import pickle
+import torch
+import torch.nn.functional as F
+
+
+def upsample_ctx(ctx, size=(256, 256), mode='bilinear', align_corners=False):
+    """
+    Upsample a tensor of shape (N, A, B, H, W) in the last two spatial dims
+    using 2D interpolation.
+
+    Returns:
+        Tensor of shape (N, A, B, size[0], size[1])
+    """
+    N, A, B, H, W = ctx.shape
+
+    # Merge A and B into channels: (N, C, H, W)
+    x = ctx.reshape(N, A * B, H, W)
+
+    # Interpolate spatial dimensions
+    x_up = F.interpolate(x, size=size, mode=mode, align_corners=align_corners)
+
+    # Reshape back to (N, A, B, H_out, W_out)
+    H_out, W_out = size
+    return x_up.reshape(N, A, B, H_out, W_out)
+
+
+def downsample_ctx(ctx_up, size=(10, 20), mode='bilinear', align_corners=False):
+    """
+    Downsample a tensor of shape (N, A, B, H_large, W_large) back to (N, A, B, H, W).
+
+    Returns:
+        Tensor of shape (N, A, B, size[0], size[1])
+    """
+    N, A, B, H_large, W_large = ctx_up.shape
+
+    # Merge A and B into channels: (N, C, H_large, W_large)
+    x = ctx_up.reshape(N, A * B, H_large, W_large)
+
+    # Interpolate back to original spatial size
+    x_down = F.interpolate(x, size=size, mode=mode, align_corners=align_corners)
+
+    H_out, W_out = size
+    return x_down.reshape(N, A, B, H_out, W_out)
 
 
 def build_inference_pipeline(model_cfg, device="cuda", weight_dtype=torch.bfloat16):
@@ -115,18 +154,20 @@ def padding_video(video, target_size=256):
     scaled_data = F.pad(video, pad, mode='constant', value=0)
     return scaled_data, h, w, pad
 
+
 def predict_loop(name, data, seq_len, pred_len, seeds=None, scaler_list=None):
     data = torch.tensor(data).float().cuda()
     if seeds is None:
         seeds = list(range(1000))
     N, T, H, W = data.shape
     step = seq_len + pred_len
-    
+
     outs = []
 
     for i in range(N):
         ctx = data[i][:seq_len].unsqueeze(0).unsqueeze(2).repeat(1, 1, 3, 1, 1)  # (1, ctx, C, H, W)
-        ctx, h, w, pad = padding_video(ctx, target_size=256)
+        # ctx, h, w, pad = boundary_padding(ctx, target_size=256)
+        ctx = upsample_ctx(ctx)
         # print('ctx: ', ctx.shape)
         input_params = {
             'context_sequence': ctx,
@@ -144,10 +185,13 @@ def predict_loop(name, data, seq_len, pred_len, seeds=None, scaler_list=None):
         if out.dim() == 4:
             out = out.unsqueeze(0)
         out = rearrange(out, '(b n) f c h w -> b n f c h w', b=1, n=1)
-        out = out[:, 0, seq_len:, :, :, :].squeeze(0)
-        out = out[..., pad[2]:pad[2]+h, pad[0]:pad[0]+w]
-        # print('out: ', out.shape)
+        # out = out[:, 0, seq_len:, :, :, :].squeeze(0) # 1 12 3 256 256
+        # out = depadding_boundary(out, pad, h, w)
+        out = out[:, :, seq_len:, :, :, :].squeeze(0) # 1 12 3 256 256
+        out = downsample_ctx(out)
+        out = out[0,:,:,:]
         out = out[:,0,:,:]
+        
         if scaler_list is not None:
             scaler = scaler_list[i]
             out_np = out.cpu().to(torch.float32).numpy()
@@ -158,6 +202,7 @@ def predict_loop(name, data, seq_len, pred_len, seeds=None, scaler_list=None):
         outs.append(out.unsqueeze(0))
 
     return torch.cat(outs, dim=0)
+
 def metric(pred, gt):
     # compute rmse and mae
     # pred B x T x H x W
@@ -171,13 +216,6 @@ def metric(pred, gt):
     return rmse, mae
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data', type=str, default='TaxiBJout')
-    parser.add_argument('--pred_len', type=int, default=6)
-    parser.add_argument('--seq_len', type=int, default=6)
-    args = parser.parse_args()
-
-
     model_cfg = {
         "transformer": {
             "init_cfg": {
@@ -198,26 +236,15 @@ if __name__ == "__main__":
     device = torch.device("cuda")
     pipeline = build_inference_pipeline(model_cfg, device=device)
     pipeline.set_progress_bar_config(disable=True)
-    
-    dataset_name = args.data
-    if dataset_name not in data_path_dict:
-        data_path = f'datasets/{dataset_name}_short.json'
-        raw_data, data, scaler_list = read_data(data_path)
-    else:
-        raw_data, data, scaler_list = read_data(data_path_dict[dataset_name])
+     
+    dataset_name = 'BikeNYC'
+    raw_data, data, scaler_list = read_data(data_path_dict[dataset_name])
     # data = data[100:105]
     # raw_data = raw_data[100:105]
     print('data shape: ', data.shape)  # N x T x H x W
-    seq_len = args.seq_len
-    pred_len = args.pred_len
+    seq_len = 6
+    pred_len = 6
     pred = predict_loop(dataset_name, data, seq_len, pred_len, scaler_list=scaler_list)
     gt = torch.tensor(raw_data[:, seq_len:seq_len+pred_len]).float().cuda()
     rmse, mae = metric(pred, gt)
     print(f"dataset_name: {dataset_name}, RMSE: {rmse}, MAE: {mae}")
-    # save pred to pkl file
-    save_path = f'results/{dataset_name}_FAR_pred.pkl'
-    os.makedirs('results', exist_ok=True)
-
-    with open(save_path, 'wb') as f:
-        pickle.dump(pred.cpu().numpy(), f)
-    print(f"Saved predictions to {save_path}")
