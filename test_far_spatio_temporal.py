@@ -123,7 +123,7 @@ def predict_loop(name, data, seq_len, pred_len, seeds=None, scaler_list=None):
     step = seq_len + pred_len
     
     outs = []
-
+    raw_outs = []
     for i in range(N):
         ctx = data[i][:seq_len].unsqueeze(0).unsqueeze(2).repeat(1, 1, 3, 1, 1)  # (1, ctx, C, H, W)
         ctx, h, w, pad = padding_video(ctx, target_size=256)
@@ -144,6 +144,7 @@ def predict_loop(name, data, seq_len, pred_len, seeds=None, scaler_list=None):
         if out.dim() == 4:
             out = out.unsqueeze(0)
         out = rearrange(out, '(b n) f c h w -> b n f c h w', b=1, n=1)
+        raw_output = out
         out = out[:, 0, seq_len:, :, :, :].squeeze(0)
         out = out[..., pad[2]:pad[2]+h, pad[0]:pad[0]+w]
         # print('out: ', out.shape)
@@ -156,8 +157,8 @@ def predict_loop(name, data, seq_len, pred_len, seeds=None, scaler_list=None):
             # out_np = scaler.inverse_transform(out_np.reshape(1, -1)).reshape(out_np.shape)
             out = torch.tensor(out_np).float().cuda()
         outs.append(out.unsqueeze(0))
-
-    return torch.cat(outs, dim=0)
+        raw_outs.append(raw_output)
+    return torch.cat(outs, dim=0), raw_outs
 def metric(pred, gt):
     # compute rmse and mae
     # pred B x T x H x W
@@ -196,28 +197,39 @@ if __name__ == "__main__":
     }
 
     device = torch.device("cuda")
-    pipeline = build_inference_pipeline(model_cfg, device=device)
+    pipeline = build_inference_pipeline(model_cfg, device=devices)
     pipeline.set_progress_bar_config(disable=True)
     
     dataset_name = args.data
     if dataset_name not in data_path_dict:
         data_path = f'datasets/{dataset_name}_short.json'
-        raw_data, data, scaler_list = read_data(data_path)
+        raw_data, data, scaler_list = read_data(data_path, num_samples=100)
     else:
-        raw_data, data, scaler_list = read_data(data_path_dict[dataset_name])
+        raw_data, data, scaler_list = read_data(data_path_dict[dataset_name], num_samples=100)
     # data = data[100:105]
     # raw_data = raw_data[100:105]
     print('data shape: ', data.shape)  # N x T x H x W
     seq_len = args.seq_len
     pred_len = args.pred_len
-    pred = predict_loop(dataset_name, data, seq_len, pred_len, scaler_list=scaler_list)
+    pred, raw_outs = predict_loop(dataset_name, data, seq_len, pred_len, scaler_list=scaler_list)
     gt = torch.tensor(raw_data[:, seq_len:seq_len+pred_len]).float().cuda()
     rmse, mae = metric(pred, gt)
     print(f"dataset_name: {dataset_name}, RMSE: {rmse}, MAE: {mae}")
     # save pred to pkl file
+    raw_outs = [out.cpu().to(torch.float32).numpy() for out in raw_outs]
+    print('raw_outs: ', raw_outs)
+    # print('data: ', data.device)
+    # print('pred: ', pred.device)
+    # print('raw_data: ', raw_data.device)
+    save = {
+        'norm_outs': raw_outs,
+        'norm_data': data,
+        'pred': pred.cpu().numpy(),
+        'data': raw_data,
+    }
     save_path = f'results/{dataset_name}_FAR_pred.pkl'
     os.makedirs('results', exist_ok=True)
 
     with open(save_path, 'wb') as f:
-        pickle.dump(pred.cpu().numpy(), f)
+        pickle.dump(save, f)
     print(f"Saved predictions to {save_path}")

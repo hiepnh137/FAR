@@ -27,11 +27,12 @@ def normalize_data_2(data):
 
     return data, min_data, max_data
 
-def read_data(path):
+def read_data(path, num_samples=None):
     data = json.load(open(path, 'r'))
     test_data = data['X_test'][0]  # N x T x H x W
     video = np.array(test_data) 
-
+    if num_samples is not None:
+        video = video[:num_samples]
     scaled_video, scaler_list = normalize_data(video)
     
     print('test_data: ', video.shape)
